@@ -1,9 +1,13 @@
 __pycache__/
+.venv/
 .env
 
 test_footage/
 sentrysearch.egg-info/
 clips_output/
+drive_videos/
+demo_index/
+scripts/download_drive_videos.ps1
 
 notebooks/
 

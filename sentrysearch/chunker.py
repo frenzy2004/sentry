@@ -10,6 +10,10 @@ import tempfile
 from pathlib import Path
 
 SUPPORTED_VIDEO_EXTENSIONS = (".mp4", ".mov")
+_H264_COLOR_METADATA_BSF = (
+    "h264_metadata=colour_primaries=1:"
+    "transfer_characteristics=1:matrix_coefficients=1"
+)
 
 
 def is_supported_video_file(path: str) -> bool:
@@ -115,6 +119,44 @@ def _get_video_duration(video_path: str) -> float:
     return _parse_duration_from_ffmpeg_output(result.stderr)
 
 
+def _should_fix_h264_color_metadata(video_path: str) -> bool:
+    """Return True for H.264 files with color metadata ffmpeg may reject."""
+    ffprobe_exe = shutil.which("ffprobe")
+    if not ffprobe_exe:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                ffprobe_exe,
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,color_primaries,color_transfer,color_space",
+                video_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        info = json.loads(result.stdout)
+        stream = (info.get("streams") or [{}])[0]
+    except Exception:
+        return False
+
+    if stream.get("codec_name") != "h264":
+        return False
+    color_values = (
+        stream.get("color_primaries"),
+        stream.get("color_transfer"),
+        stream.get("color_space"),
+    )
+    return any(v in {"reserved", "unknown"} for v in color_values)
+
+
 def expected_chunk_spans(
     duration: float,
     chunk_duration: int = 30,
@@ -172,25 +214,25 @@ def chunk_video(
     ffmpeg_exe = _get_ffmpeg_executable()
     duration = _get_video_duration(video_path)
     spans = expected_chunk_spans(duration, chunk_duration, overlap)
+    fix_h264_color = _should_fix_h264_color_metadata(video_path)
     tmp_dir = tempfile.mkdtemp(prefix="sentrysearch_")
     chunks = []
 
     for idx, (start, end) in enumerate(spans):
         t = end - start
         chunk_path = os.path.join(tmp_dir, f"chunk_{idx:03d}.mp4")
-        subprocess.run(
-            [
-                ffmpeg_exe,
-                "-y",
-                "-ss", str(start),
-                "-i", video_path,
-                "-t", str(t),
-                "-c", "copy",
-                chunk_path,
-            ],
-            capture_output=True,
-            check=True,
-        )
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-ss", str(start),
+            "-i", video_path,
+            "-t", str(t),
+            "-c", "copy",
+        ]
+        if fix_h264_color:
+            cmd.extend(["-bsf:v", _H264_COLOR_METADATA_BSF])
+        cmd.append(chunk_path)
+        subprocess.run(cmd, capture_output=True, check=True)
         chunks.append({
             "chunk_path": chunk_path,
             "source_file": video_path,
@@ -319,21 +361,39 @@ def preprocess_chunk(
         base, ext = os.path.splitext(chunk_path)
         out_path = f"{base}_preprocessed{ext}"
 
-        subprocess.run(
-            [
+        def run_preprocess(input_path: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run([
                 ffmpeg_exe,
                 "-y",
-                "-i", chunk_path,
+                "-i", input_path,
                 "-vf", f"scale=-2:{target_resolution},fps={target_fps}",
                 "-c:v", "libx264",
                 "-crf", "28",
                 "-c:a", "aac",
                 "-b:a", "64k",
                 out_path,
-            ],
-            capture_output=True,
-            check=True,
-        )
+            ], capture_output=True, text=True)
+
+        result = run_preprocess(chunk_path)
+        if result.returncode != 0 and "Invalid color space" in result.stderr:
+            fixed_path = f"{base}_color_fixed{ext}"
+            fixed = subprocess.run([
+                ffmpeg_exe,
+                "-y",
+                "-i", chunk_path,
+                "-map", "0:v:0",
+                "-map", "0:a?",
+                "-c", "copy",
+                "-bsf:v",
+                "h264_metadata=colour_primaries=1:"
+                "transfer_characteristics=1:matrix_coefficients=1",
+                fixed_path,
+            ], capture_output=True, text=True)
+            if fixed.returncode == 0 and os.path.isfile(fixed_path):
+                result = run_preprocess(fixed_path)
+
+        if result.returncode != 0:
+            return chunk_path
         return out_path
     except Exception:
         return chunk_path

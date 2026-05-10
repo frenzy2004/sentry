@@ -1,15 +1,16 @@
 ---
 name: natural-language-video-search
 description: >
-  Semantic search over video files using Gemini embeddings.
+  Semantic search over video files using Gemini, OpenRouter, or local embeddings.
   Index dashcam, security camera, or any mp4 footage, then search
   with natural language queries to find and auto-trim matching clips.
-version: 0.2.3
+version: 0.2.4
 metadata:
   clawdbot:
     requires:
       env:
         - GEMINI_API_KEY
+        - OPENROUTER_API_KEY
       bins:
         - python3
         - uv
@@ -21,11 +22,11 @@ metadata:
 
 # Natural Language Video Search
 
-Search video files using natural language queries powered by Gemini Embedding 2's native video-to-vector embedding.
+Search video files using natural language queries powered by Gemini Embedding 2, OpenRouter-backed Gemini tags, or local Qwen3-VL embeddings.
 
 ## What This Skill Does
 
-This skill lets you index video files (dashcam footage, security camera recordings, any mp4) into a local vector database, then search them by describing what you're looking for in plain English. The top match is automatically trimmed and saved as a clip.
+This skill lets you index video files (dashcam footage, security camera recordings, any mp4) into a local vector database, then search them by describing what you're looking for in plain English. The top match is automatically trimmed and saved as a clip, or several b-roll clips can be saved from a single prompt.
 
 For Tesla dashcam footage, an optional telemetry overlay can burn speed, GPS, location, and turn signal data onto trimmed clips.
 
@@ -53,7 +54,7 @@ uv sync --extra tesla
 sentrysearch init
 ```
 
-This prompts for your key, writes it to `.env`, and validates it with a test embedding. You can also set `GEMINI_API_KEY` directly as an environment variable.
+This prompts for a direct Gemini key, writes it to `.env`, and validates it with a test embedding. You can also set `GEMINI_API_KEY` directly, set `OPENROUTER_API_KEY` and run with `--backend openrouter`, or use `--backend local`.
 
 ## Commands
 
@@ -63,7 +64,7 @@ This prompts for your key, writes it to `.env`, and validates it with a test emb
 sentrysearch index <directory_or_file>
 ```
 
-Options: `--chunk-duration` (default 30s), `--overlap` (default 5s), `--no-preprocess`, `--target-resolution`, `--target-fps`, `--skip-still` / `--no-skip-still`, `--verbose`
+Options: `--chunk-duration` (default 30s), `--overlap` (default 5s), `--no-preprocess`, `--target-resolution`, `--target-fps`, `--skip-still` / `--no-skip-still`, `--backend gemini|openrouter|local`, `--verbose`
 
 ### Search indexed footage
 
@@ -72,6 +73,15 @@ sentrysearch search "<natural language query>"
 ```
 
 Options: `-n` / `--results` (default 5), `-o` / `--output-dir`, `--trim` / `--no-trim`, `--threshold` (default 0.41), `--overlay` / `--no-overlay` (Tesla telemetry), `--verbose`
+
+### Pull b-roll
+
+```bash
+sentrysearch broll "<short b-roll prompt>" --clips 5
+sentrysearch broll-shell --clips 5
+```
+
+Use `broll` to save several reusable clips at once. Use `broll-shell` for fast editing sessions: it keeps the index and query embedder loaded, then saves clips for each prompt typed at `broll>`. Inside the shell, use `:clips N`, `:n N`, `:open on|off`, `:help`, and `:quit`.
 
 ### Apply Tesla telemetry overlay
 
@@ -113,6 +123,12 @@ Action: Run `sentrysearch index ~/Downloads`
 User: "Search for a red light and include the Tesla overlay on the clip"
 Action: Run `sentrysearch search "running a red light" --overlay`
 
+User: "Give me five b-roll clips of coffee shop exterior"
+Action: Run `sentrysearch broll "coffee shop exterior" --clips 5`
+
+User: "I'm going to try a bunch of b-roll prompts"
+Action: Run `sentrysearch broll-shell --clips 5`
+
 User: "Add the speed and GPS overlay to this Tesla video"
 Action: Run `sentrysearch overlay /path/to/tesla_video.mp4`
 
@@ -121,7 +137,7 @@ Action: Run `sentrysearch stats`
 
 ## Rules
 
-- Always run `sentrysearch init` or confirm GEMINI_API_KEY is set before indexing or searching.
+- Confirm the selected backend has credentials or local model access: `GEMINI_API_KEY` for direct Gemini, `OPENROUTER_API_KEY` for OpenRouter, or `--backend local` for local search.
 - If ffmpeg is not found on PATH, the bundled `imageio-ffmpeg` fallback is used automatically.
 - Indexing costs ~$2.84/hour of active footage with default settings. Cost is driven by the number of chunks sent to the API — footage with long idle periods (sentry mode, security cameras) will be significantly cheaper since still-frame skipping eliminates those chunks entirely. Warn the user before indexing large directories.
 - Search results include similarity scores. Scores below the threshold (default 0.41) trigger a low-confidence prompt before trimming.

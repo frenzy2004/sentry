@@ -39,6 +39,48 @@ class TestSentryStore:
         assert stats["unique_source_files"] == 0
         assert stats["source_files"] == []
 
+    def test_uses_configured_db_path_env(self, tmp_path, monkeypatch):
+        from sentrysearch.store import SentryStore
+
+        db_path = tmp_path / "portable_db"
+        monkeypatch.setenv("SENTRYSEARCH_DB_PATH", str(db_path))
+
+        store = SentryStore(backend="gemini")
+        store.add_chunk("c1", _make_embedding(), {
+            "source_file": "v.mp4",
+            "start_time": 0.0,
+            "end_time": 30.0,
+        })
+
+        assert (db_path / "chroma.sqlite3").exists()
+
+    def test_remaps_missing_sources_to_configured_library_root(
+        self, tmp_path, monkeypatch,
+    ):
+        from sentrysearch.store import SentryStore
+
+        local_library = tmp_path / "local_library"
+        local_source = local_library / "nested" / "clip.mp4"
+        local_source.parent.mkdir(parents=True)
+        local_source.write_bytes(b"video")
+        indexed_source = str(
+            tmp_path / "old_machine" / "drive_videos" / "library" /
+            "nested" / "clip.mp4"
+        )
+        monkeypatch.setenv("SENTRYSEARCH_LIBRARY_ROOT", str(local_library))
+
+        store = SentryStore(db_path=tmp_path / "db", backend="gemini")
+        embedding = _make_embedding()
+        store.add_chunk("c1", embedding, {
+            "source_file": indexed_source,
+            "start_time": 0.0,
+            "end_time": 30.0,
+        })
+
+        remapped = str(local_source.resolve())
+        assert store.get_stats()["source_files"] == [remapped]
+        assert store.search(embedding, n_results=1)[0]["source_file"] == remapped
+
     def test_empty_store_search(self, tmp_store):
         results = tmp_store.search(_make_embedding(), n_results=5)
         assert results == []
@@ -171,6 +213,17 @@ class TestStoreBackend:
         store = SentryStore(db_path=tmp_path / "db", backend="gemini")
         assert store.collection.name == "dashcam_chunks"
 
+    def test_openrouter_backend_collection_name(self, tmp_path):
+        from sentrysearch.store import SentryStore
+
+        store = SentryStore(
+            db_path=tmp_path / "db",
+            backend="openrouter",
+            model="google/gemini-2.5-flash",
+        )
+        assert store.collection.name == "dashcam_chunks_openrouter_google_gemini-2_5-flash"
+        assert store.get_model() == "google/gemini-2.5-flash"
+
     def test_backends_use_separate_collections(self, tmp_path):
         from sentrysearch.store import SentryStore
 
@@ -275,6 +328,21 @@ class TestDetectIndex:
             "source_file": "v.mp4", "start_time": 0.0, "end_time": 30.0,
         })
         assert detect_index(tmp_path / "db") == ("local", "qwen2b")
+
+    def test_detects_openrouter_model(self, tmp_path):
+        from sentrysearch.store import SentryStore, detect_index
+
+        store = SentryStore(
+            db_path=tmp_path / "db",
+            backend="openrouter",
+            model="google/gemini-2.5-flash",
+        )
+        store.add_chunk("c1", _make_embedding(dim=384), {
+            "source_file": "v.mp4", "start_time": 0.0, "end_time": 30.0,
+        })
+        assert detect_index(tmp_path / "db") == (
+            "openrouter", "google/gemini-2.5-flash",
+        )
 
     def test_legacy_local_treated_as_qwen8b(self, tmp_path):
         from sentrysearch.store import SentryStore, detect_index

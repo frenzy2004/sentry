@@ -24,6 +24,10 @@ def get_embedder(backend: str = "gemini", **kwargs) -> BaseEmbedder:
             dims = kwargs.get("dimensions", 768)
             quantize = kwargs.get("quantize", None)
             _current_embedder = LocalEmbedder(model_name=model, dimensions=dims, quantize=quantize)
+        elif backend == "openrouter":
+            from .openrouter_embedder import DEFAULT_OPENROUTER_MODEL, OpenRouterEmbedder
+            model = kwargs.get("model") or DEFAULT_OPENROUTER_MODEL
+            _current_embedder = OpenRouterEmbedder(model=model)
         else:
             raise ValueError(f"Unknown backend: {backend}")
     return _current_embedder

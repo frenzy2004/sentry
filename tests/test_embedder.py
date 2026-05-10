@@ -1,17 +1,25 @@
 """Tests for sentrysearch embedder (factory + gemini backend)."""
 
 import os
+import socket
 import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from sentrysearch import gemini_embedder as gemini_module
 from sentrysearch.gemini_embedder import (
     GeminiAPIKeyError,
     GeminiEmbedder,
     GeminiQuotaError,
     _RateLimiter,
+    _install_gemini_dns_fallback,
     _retry,
+)
+from sentrysearch.openrouter_embedder import (
+    OpenRouterAPIKeyError,
+    OpenRouterEmbedder,
+    _compact_description,
 )
 from sentrysearch.embedder import (
     embed_image,
@@ -76,6 +84,77 @@ class TestGeminiEmbedder:
         with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key-123"}):
             embedder = GeminiEmbedder()
             mock_client_cls.assert_called_once_with(api_key="test-key-123")
+
+
+class TestGeminiDnsFallback:
+    def test_resolves_gemini_host_through_configured_ip(self, monkeypatch):
+        fake_result = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.7", 443))]
+        calls = []
+
+        def fake_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            calls.append(host)
+            if host == "203.0.113.7":
+                return fake_result
+            raise socket.gaierror("blocked")
+
+        monkeypatch.setattr(gemini_module, "_ORIGINAL_GETADDRINFO", fake_getaddrinfo)
+        monkeypatch.setattr(gemini_module, "_DNS_FALLBACK_INSTALLED", False)
+        monkeypatch.setattr(gemini_module.socket, "getaddrinfo", fake_getaddrinfo)
+        monkeypatch.setenv("SENTRYSEARCH_GEMINI_HOST_IPS", "203.0.113.7")
+
+        _install_gemini_dns_fallback()
+
+        assert socket.getaddrinfo("generativelanguage.googleapis.com", 443) == fake_result
+        assert calls == ["203.0.113.7"]
+
+    def test_leaves_other_hosts_on_system_resolver(self, monkeypatch):
+        def fake_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            if host == "example.com":
+                return [("ok",)]
+            raise socket.gaierror("blocked")
+
+        monkeypatch.setattr(gemini_module, "_ORIGINAL_GETADDRINFO", fake_getaddrinfo)
+        monkeypatch.setattr(gemini_module, "_DNS_FALLBACK_INSTALLED", False)
+        monkeypatch.setattr(gemini_module.socket, "getaddrinfo", fake_getaddrinfo)
+        monkeypatch.setenv("SENTRYSEARCH_GEMINI_HOST_IPS", "203.0.113.7")
+
+        _install_gemini_dns_fallback()
+
+        assert socket.getaddrinfo("example.com", 443) == [("ok",)]
+
+
+class TestOpenRouterCaptionPostprocess:
+    def test_compact_description_normalizes_whitespace(self):
+        assert _compact_description("  red car\n\n driving   night  ") == "red car driving night"
+
+    def test_compact_description_truncates_at_word_boundary(self):
+        text = " ".join(["keyword"] * 80)
+        result = _compact_description(text, limit=40)
+        assert len(result) <= 40
+        assert result.endswith("keyword")
+
+    def test_compact_description_removes_noisy_tags(self):
+        result = _compact_description(
+            "Man, talking, microphone, none, no visible text, microphone",
+        )
+        assert result == "Man, talking, microphone"
+
+
+class TestOpenRouterEmbedder:
+    def test_can_embed_query_without_api_key(self):
+        with patch.dict(os.environ, {}, clear=True):
+            embedder = OpenRouterEmbedder()
+        with patch.object(
+            embedder, "_get_text_embedding_fn",
+            return_value=lambda texts: [[0.1, 0.2, 0.3]],
+        ):
+            assert embedder.embed_query("hands typing laptop") == [0.1, 0.2, 0.3]
+
+    def test_captioning_requires_api_key(self):
+        with patch.dict(os.environ, {}, clear=True):
+            embedder = OpenRouterEmbedder()
+        with pytest.raises(OpenRouterAPIKeyError, match="OPENROUTER_API_KEY"):
+            embedder._post_chat([{"type": "text", "text": "caption this"}])
 
 
 # ---------------------------------------------------------------------------
@@ -246,3 +325,18 @@ class TestEmbedderFactory:
             reset_embedder()
             get_embedder("local", model="qwen2b")
             MockLocal.assert_called_once_with(model_name="qwen2b", dimensions=768, quantize=None)
+
+    def test_get_embedder_openrouter_backend(self):
+        with patch("sentrysearch.openrouter_embedder.OpenRouterEmbedder") as MockOpenRouter:
+            mock_instance = MagicMock()
+            MockOpenRouter.return_value = mock_instance
+            reset_embedder()
+            result = get_embedder("openrouter", model="google/gemini-2.5-flash")
+            MockOpenRouter.assert_called_once_with(model="google/gemini-2.5-flash")
+            assert result is mock_instance
+
+    def test_get_embedder_openrouter_default_model(self):
+        with patch("sentrysearch.openrouter_embedder.OpenRouterEmbedder") as MockOpenRouter:
+            reset_embedder()
+            get_embedder("openrouter")
+            MockOpenRouter.assert_called_once_with(model="google/gemini-2.5-flash")

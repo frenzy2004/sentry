@@ -1,13 +1,18 @@
 """ChromaDB vector store."""
 
 import hashlib
+import os
+import re
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 import chromadb
 
 
 DEFAULT_DB_PATH = Path.home() / ".sentrysearch" / "db"
+DB_PATH_ENV = "SENTRYSEARCH_DB_PATH"
+LIBRARY_ROOT_ENV = "SENTRYSEARCH_LIBRARY_ROOT"
 
 
 class BackendMismatchError(RuntimeError):
@@ -18,20 +23,94 @@ def _collection_name(backend: str, model: str | None = None) -> str:
     """Return ChromaDB collection name for a backend and optional model."""
     if backend == "gemini":
         return "dashcam_chunks"
+    if backend == "openrouter":
+        suffix = _collection_safe_model_key(model or "google_gemini_2_5_flash")
+        return _fit_collection_name(f"dashcam_chunks_openrouter_{suffix}")
     if model:
         return f"dashcam_chunks_local_{model}"
     # Legacy: local backend without model distinction
     return "dashcam_chunks_local"
 
 
+def _collection_safe_model_key(model: str) -> str:
+    """Return a Chroma collection-safe model suffix."""
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", model).strip("_-").lower()
+    return safe or "default"
+
+
+def _fit_collection_name(name: str) -> str:
+    """Keep generated Chroma collection names within Chroma's length limit."""
+    if len(name) <= 63:
+        return name
+    digest = hashlib.sha256(name.encode()).hexdigest()[:8]
+    return f"{name[:54]}_{digest}"
+
+
+def default_db_path() -> Path:
+    """Return the configured Chroma DB path."""
+    configured = os.environ.get(DB_PATH_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    return DEFAULT_DB_PATH
+
+
+@lru_cache(maxsize=256)
+def _find_library_file(root: str, basename: str) -> str | None:
+    """Find a file by basename under a configured portable library root."""
+    root_path = Path(root)
+    direct = root_path / basename
+    if direct.is_file():
+        return str(direct.resolve())
+
+    basename_lower = basename.lower()
+    try:
+        for candidate in root_path.rglob("*"):
+            if candidate.is_file() and candidate.name.lower() == basename_lower:
+                return str(candidate.resolve())
+    except OSError:
+        return None
+    return None
+
+
+def remap_source_file(source_file: str) -> str:
+    """Map indexed source paths to a local portable library when configured."""
+    source_path = Path(source_file).expanduser()
+    if source_path.is_file():
+        return str(source_path.resolve())
+
+    root = os.environ.get(LIBRARY_ROOT_ENV)
+    if not root:
+        return source_file
+
+    root_path = Path(root).expanduser().resolve()
+    parts = list(source_path.parts)
+    lower_parts = [p.lower() for p in parts]
+    candidates: list[Path] = []
+
+    for idx, part in enumerate(lower_parts[:-1]):
+        if part == "drive_videos" and lower_parts[idx + 1] == "library":
+            candidates.append(root_path.joinpath(*parts[idx + 2:]))
+            break
+
+    candidates.append(root_path / source_path.name)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate.resolve())
+
+    found = _find_library_file(str(root_path), source_path.name)
+    return found or source_file
+
+
 def detect_index(db_path: str | Path | None = None) -> tuple[str | None, str | None]:
     """Return ``(backend, model)`` for the first index with data.
 
     Returns ``(None, None)`` when no index contains data.
-    Checks gemini first, then model-specific local collections, then the
-    legacy ``dashcam_chunks_local`` collection (treated as qwen8b).
+    Checks gemini first, then OpenRouter, then model-specific local
+    collections, then the legacy ``dashcam_chunks_local`` collection
+    (treated as qwen8b).
     """
-    db_path = str(db_path or DEFAULT_DB_PATH)
+    db_path = str(db_path or default_db_path())
     if not Path(db_path).exists():
         return None, None
     client = chromadb.PersistentClient(path=db_path)
@@ -42,6 +121,14 @@ def detect_index(db_path: str | Path | None = None) -> tuple[str | None, str | N
         col = client.get_collection("dashcam_chunks")
         if col.count() > 0:
             return "gemini", None
+
+    # OpenRouter Gemini caption indexes
+    for name in sorted(existing):
+        if name.startswith("dashcam_chunks_openrouter_"):
+            col = client.get_collection(name)
+            if col.count() > 0:
+                meta = col.metadata or {}
+                return "openrouter", meta.get("embedding_model")
 
     # Model-specific local collections (dashcam_chunks_local_<model>)
     for name in sorted(existing):
@@ -81,7 +168,7 @@ class SentryStore:
 
     def __init__(self, db_path: str | Path | None = None, backend: str = "gemini",
                  model: str | None = None):
-        db_path = str(db_path or DEFAULT_DB_PATH)
+        db_path = str(db_path or default_db_path())
         Path(db_path).mkdir(parents=True, exist_ok=True)
         self._client = chromadb.PersistentClient(path=db_path)
         self._backend = backend
@@ -199,13 +286,17 @@ class SentryStore:
         for i in range(len(results["ids"][0])):
             meta = results["metadatas"][0][i]
             distance = results["distances"][0][i]
-            hits.append({
-                "source_file": meta["source_file"],
+            hit = {
+                "source_file": remap_source_file(meta["source_file"]),
                 "start_time": meta["start_time"],
                 "end_time": meta["end_time"],
                 "score": 1.0 - distance,  # cosine distance → similarity
                 "distance": distance,
-            })
+            }
+            for key, value in meta.items():
+                if key not in hit:
+                    hit[key] = value
+            hits.append(hit)
         return hits
 
     def is_indexed(self, source_file: str) -> bool:
@@ -241,7 +332,10 @@ class SentryStore:
 
         # Fetch all metadata (only the fields we need)
         all_meta = self._collection.get(include=["metadatas"])
-        source_files = sorted({m["source_file"] for m in all_meta["metadatas"]})
+        source_files = sorted({
+            remap_source_file(m["source_file"])
+            for m in all_meta["metadatas"]
+        })
         return {
             "total_chunks": total,
             "unique_source_files": len(source_files),

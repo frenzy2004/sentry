@@ -4,6 +4,7 @@ Embeds video chunks inline via Part.from_bytes — no Files API needed.
 """
 
 import os
+import socket
 import sys
 import time
 from collections import deque
@@ -17,6 +18,20 @@ load_dotenv()
 EMBED_MODEL = "gemini-embedding-2-preview"
 DIMENSIONS = 768
 DEFAULT_RPM = 55
+GEMINI_API_HOST = "generativelanguage.googleapis.com"
+GEMINI_DNS_FALLBACK_IPS = (
+    "142.251.16.95",
+    "142.251.111.95",
+    "142.251.163.95",
+    "142.251.167.95",
+    "172.253.62.95",
+    "172.253.63.95",
+    "64.233.180.95",
+)
+
+_ORIGINAL_GETADDRINFO = socket.getaddrinfo
+_DNS_FALLBACK_INSTALLED = False
+_TRUSTSTORE_INSTALLED = False
 
 # ---------------------------------------------------------------------------
 # Rate limiter
@@ -55,6 +70,69 @@ class GeminiQuotaError(RuntimeError):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _install_gemini_dns_fallback() -> None:
+    """Route Gemini API DNS lookups through known Google API IPs.
+
+    Some networks block or break OS DNS while still allowing direct HTTPS to
+    Google's API edge. The google-genai client does not expose a resolver hook,
+    so this narrow fallback keeps SentrySearch usable without changing system
+    DNS settings. TLS still validates against the original hostname.
+    """
+    global _DNS_FALLBACK_INSTALLED
+    if _DNS_FALLBACK_INSTALLED:
+        return
+    if os.environ.get("SENTRYSEARCH_DISABLE_GEMINI_DNS_FALLBACK"):
+        return
+
+    configured_ips = os.environ.get("SENTRYSEARCH_GEMINI_HOST_IPS")
+    fallback_ips = tuple(
+        ip.strip()
+        for ip in (configured_ips.split(",") if configured_ips else GEMINI_DNS_FALLBACK_IPS)
+        if ip.strip()
+    )
+    if not fallback_ips:
+        return
+
+    def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        normalized = str(host).rstrip(".").lower()
+        if normalized != GEMINI_API_HOST:
+            return _ORIGINAL_GETADDRINFO(host, port, family, type, proto, flags)
+
+        results = []
+        for ip in fallback_ips:
+            try:
+                results.extend(
+                    _ORIGINAL_GETADDRINFO(ip, port, family, type, proto, flags)
+                )
+            except socket.gaierror:
+                continue
+        if results:
+            return results
+        return _ORIGINAL_GETADDRINFO(host, port, family, type, proto, flags)
+
+    socket.getaddrinfo = getaddrinfo
+    _DNS_FALLBACK_INSTALLED = True
+
+
+def _install_system_truststore() -> None:
+    """Use the OS certificate store when available.
+
+    This fixes Windows environments where HTTPS is inspected by local security
+    software. In that setup certifi may reject otherwise trusted local roots.
+    """
+    global _TRUSTSTORE_INSTALLED
+    if _TRUSTSTORE_INSTALLED:
+        return
+    if os.environ.get("SENTRYSEARCH_DISABLE_TRUSTSTORE"):
+        return
+    try:
+        import truststore
+    except ImportError:
+        return
+    truststore.inject_into_ssl()
+    _TRUSTSTORE_INSTALLED = True
+
 
 def _retry(fn, *, max_retries: int = 5, initial_delay: float = 2.0, max_delay: float = 60.0):
     """Call *fn* with exponential back-off on transient errors (429, 503)."""
@@ -96,6 +174,9 @@ class GeminiEmbedder(BaseEmbedder):
     """Gemini Embedding 2 backend (API-based)."""
 
     def __init__(self):
+        _install_system_truststore()
+        _install_gemini_dns_fallback()
+
         from google import genai
         from google.genai import types  # noqa: F811
 

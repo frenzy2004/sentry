@@ -10,11 +10,17 @@ Semantic search over video footage. Type what you're looking for, get a trimmed 
 
 - [How it works](#how-it-works)
 - [Getting Started](#getting-started)
+- [B-roll App Quick Start for Testers](#b-roll-app-quick-start-for-testers)
 - [Usage](#usage)
   - [Init](#init)
   - [Index footage](#index-footage)
   - [Search](#search)
+  - [B-roll](#b-roll)
+  - [Web UI](#web-ui)
+  - [Portable demo index](#portable-demo-index)
+  - [Friend testing setup](#friend-testing-setup)
   - [Search by image](#search-by-image)
+  - [OpenRouter Backend](#openrouter-backend)
   - [Local Backend (no API key needed)](#local-backend-no-api-key-needed)
   - [Why the local model is fast](#why-the-local-model-is-fast)
   - [Tesla Metadata Overlay](#tesla-metadata-overlay)
@@ -30,7 +36,7 @@ Semantic search over video footage. Type what you're looking for, get a trimmed 
 
 ## How it works
 
-SentrySearch splits your videos into overlapping chunks, embeds each chunk as video using either Google's Gemini Embedding API or a local Qwen3-VL model, and stores the vectors in a local ChromaDB database. When you search, your text query (or image, see [search by image](#search-by-image)) is embedded into the same vector space and matched against the stored video embeddings. The top match is automatically trimmed from the original file and saved as a clip.
+SentrySearch splits your videos into overlapping chunks, embeds each chunk using Google's Gemini Embedding API, OpenRouter-backed Gemini vision captions, or a local Qwen3-VL model, and stores the vectors in a local ChromaDB database. When you search, your text query (or image, see [search by image](#search-by-image)) is embedded into the same vector space and matched against the stored video embeddings. The top match is automatically trimmed from the original file and saved as a clip.
 
 ## Getting Started
 
@@ -77,7 +83,186 @@ sentrysearch search "red truck running a stop sign"
 
 ffmpeg is required for video chunking and trimming. If you don't have it system-wide, the bundled `imageio-ffmpeg` is used automatically.
 
-> **Manual setup:** If you prefer not to use `sentrysearch init`, you can copy `.env.example` to `.env` and add your key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey) manually.
+> **Manual setup:** If you prefer not to use `sentrysearch init`, you can copy `.env.example` to `.env` and add your key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey) manually. For OpenRouter, set `OPENROUTER_API_KEY` and index with `--backend openrouter`.
+
+## B-roll App Quick Start for Testers
+
+This is the recommended flow when someone wants to clone this version, connect their own Google Drive or local footage folder, and use the browser UI for b-roll.
+
+### What the tester gets
+
+- A local browser app at `http://127.0.0.1:8765`
+- Search over indexed video chunks using normal prompts like `hands typing laptop`
+- Video previews with exact time ranges
+- Tick/select clips manually
+- `Generate Pack` exports only the selected time ranges, not full source videos
+- `In Files` opens the output folder in File Explorer
+- The **Library** section scans a video folder and indexes only new videos
+
+### What stays local
+
+The videos, Chroma DB, generated clips, previews, and CPU/storage work stay on the tester's computer. OpenRouter is only called when indexing new videos. Searching an already-indexed library is local.
+
+### Requirements
+
+Install these first:
+
+- Git
+- Python 3.11 or newer
+- `uv`
+- Google Drive for desktop if the videos live in Drive
+- Optional: FFmpeg system install. The app has a Python ffmpeg fallback, but a normal FFmpeg install is still useful.
+
+Install `uv` on Windows:
+
+```powershell
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Close and reopen PowerShell after installing `uv`.
+
+### Clone and install
+
+Use the repo or branch that contains this b-roll UI work:
+
+```powershell
+git clone <YOUR_REPO_URL> sentrysearch-broll
+cd sentrysearch-broll
+uv sync
+```
+
+If you are giving this to a friend, push this project to your own repo first and send them that repo URL. The original upstream repo may not contain the b-roll UI additions yet.
+
+### Add the OpenRouter key
+
+Create this file:
+
+```text
+C:\Users\<your-windows-name>\.sentrysearch\.env
+```
+
+Put this inside it:
+
+```text
+OPENROUTER_API_KEY=your-openrouter-key-here
+```
+
+Do not commit this file. Do not send real API keys in chat.
+
+The key is needed for indexing new videos. It is not needed just to search an already-indexed OpenRouter library.
+
+### Connect Google Drive footage
+
+Install Google Drive for desktop and sign in. Streaming mode is fine. The app only needs a local-looking folder path.
+
+Examples:
+
+```text
+G:\My Drive\Broll Videos
+G:\Shared drives\Creator Team\Broll
+C:\Users\<name>\My Drive\Broll Videos
+```
+
+Copy the folder path that actually contains the `.mp4` or `.mov` files.
+
+### Run the app
+
+From the repo folder:
+
+```powershell
+uv run sentrysearch ui
+```
+
+Open:
+
+```text
+http://127.0.0.1:8765
+```
+
+### First run inside the UI
+
+1. In **Library**, paste the Google Drive or local video folder path.
+2. Click **Scan Folder**.
+3. Confirm the count: videos found, already indexed, and new videos.
+4. Click **Index New Videos**.
+5. Wait for the log to finish. Failed files are logged and do not stop the whole library.
+6. Search for b-roll with any prompt.
+7. Tick the clips you want.
+8. Click **Generate Selected Pack**.
+9. Click **In Files** to open the exported clips.
+
+The default local video folder is:
+
+```text
+drive_videos\library
+```
+
+So if a tester does not use Google Drive, they can put footage there and scan that folder.
+
+### Day-to-day workflow
+
+After the first index:
+
+```powershell
+cd sentrysearch-broll
+uv run sentrysearch ui
+```
+
+Then in the browser:
+
+1. Search normally.
+2. Select clips.
+3. Generate a pack.
+
+When new videos are added to Drive:
+
+1. Paste or keep the same Library folder.
+2. Click **Scan Folder**.
+3. Click **Index New Videos**.
+
+The app skips already-indexed videos by filename/path, so refreshing the library is safe.
+
+### Where files are saved
+
+Generated selected packs go here by default:
+
+```text
+drive_videos\broll_packs_ui
+```
+
+Single saved clips go here:
+
+```text
+drive_videos\ui_saved
+```
+
+Index logs go here:
+
+```text
+drive_videos\index_logs
+```
+
+### Score colors
+
+The score is a similarity score from search:
+
+- Green: strong match
+- Yellow: possible match
+- Red: loose match
+
+Use the video preview as the final judge. The score is a ranking hint, not a guarantee.
+
+### Troubleshooting
+
+If the UI says `No indexed footage found`, scan and index a library first.
+
+If videos do not preview, the indexed file path is not available locally. Make sure Google Drive for desktop is running and the Library folder points at the right Drive folder.
+
+If indexing asks for `OPENROUTER_API_KEY`, add it to `C:\Users\<name>\.sentrysearch\.env` and restart the UI.
+
+If indexing is slow, that is normal for large videos. Google Drive may also stream the source file the first time it is read.
+
+If disk space gets low, delete old generated clips from `drive_videos\broll_packs_ui` and `drive_videos\ui_saved`.
 
 ## Usage
 
@@ -112,6 +297,7 @@ Options:
 - `--target-resolution 480` — target height in pixels for preprocessing
 - `--target-fps 5` — target frame rate for preprocessing
 - `--no-skip-still` — embed all chunks, even ones with no visual change
+- `--backend openrouter` - use Gemini through OpenRouter for video captioning, then local text embeddings ([details below](#openrouter-backend))
 - `--backend local` — use a local model instead of Gemini ([details below](#local-backend-no-api-key-needed))
 
 ### Search
@@ -135,6 +321,88 @@ With `--no-trim`, low-confidence results are shown with a note instead of a prom
 
 Options: `--results N`, `--output-dir DIR`, `--no-trim` to skip auto-trimming, `--threshold 0.5` to adjust the confidence cutoff, `--save-top N` to save the top N clips instead of just the best match. Backend and model are auto-detected from the index — pass `--backend` or `--model` only to override.
 
+### B-roll
+
+Use `broll` when you want several reusable clips for an edit:
+
+```bash
+$ sentrysearch broll "cinematic city traffic at night" --clips 5
+  #1 [0.84] city_walk_001.mp4 @ 01:15-01:45
+  #2 [0.80] skyline_003.mp4 @ 00:50-01:20
+  ...
+
+Saved clip: ~/sentrysearch_broll/match_city_walk_001_01m15s-01m45s.mp4
+Saved clip: ~/sentrysearch_broll/match_skyline_003_00m50s-01m20s.mp4
+```
+
+By default, `broll` ranks 10 candidates and saves the top 5 clips into `~/sentrysearch_broll`. Use `--clips N` to change how many clips are saved, `--results N` to rank a wider candidate set, and the same backend/model flags as `search`.
+
+Use `broll-pack` when you want editor-ready folders for multiple b-roll categories in one run:
+
+```bash
+$ sentrysearch broll-pack --clips 4 --output-dir ./broll_packs
+
+[hands_typing_laptop] hands typing laptop
+  saved 1: ./broll_packs/hands_typing_laptop/clip_01_...
+  ...
+
+[outdoor_night_interview] outdoor night interview
+  saved 1: ./broll_packs/outdoor_night_interview/clip_01_...
+  ...
+
+Saved 28 clips across 7 categories.
+Manifest: ./broll_packs/manifest.csv
+```
+
+Without `--prompt`, `broll-pack` uses a starter set of creator-friendly categories such as `hands typing laptop`, `people laughing indoors`, `outdoor night interview`, and `office presentation screen`. Pass repeated `--prompt "..."` flags or `--prompts-file prompts.txt` to make your own pack. It writes one folder per prompt plus a `manifest.csv` with source file, timestamp, score, and description. `--min-gap` avoids near-duplicate clips from the same source moment, and `--allow-cross-prompt-duplicates` lets categories reuse the same clip when you want overlap.
+
+For rapid back-to-back b-roll pulls, keep the index and text embedder warm:
+
+```bash
+$ sentrysearch broll-shell --clips 5
+Loading openrouter (google/gemini-2.5-flash)...
+Ready. 90 chunks indexed. 5 clips/query. Type a b-roll prompt, :help for commands.
+broll> coffee shop exterior morning
+  #1 [0.82] cafe_001.mp4 @ 00:40-01:10
+  #2 [0.78] street_004.mp4 @ 02:15-02:45
+  saved: ~/sentrysearch_broll/match_cafe_001_00m40s-01m10s.mp4
+  saved: ~/sentrysearch_broll/match_street_004_02m15s-02m45s.mp4
+broll> hands pouring espresso close up
+```
+
+Inside `broll-shell`, use `:clips N`, `:n N`, `:open on|off`, `:help`, and `:quit`. This is the fastest workflow when you are trying a lot of short b-roll prompts in one editing session.
+
+### Web UI
+
+Start the local b-roll browser when you want to preview, save, and pack clips visually:
+
+```bash
+$ sentrysearch ui
+SentrySearch UI running at http://127.0.0.1:8765
+```
+
+The UI searches the existing local index, streams matching source videos for preview, saves individual clips, and can generate a multi-category b-roll pack with a manifest. It also includes a **Library** section where you paste a local or Google Drive for desktop folder, scan for videos, and index only new files. Searches over an already-indexed OpenRouter library use local text embeddings; API calls are only needed when indexing new videos.
+
+The search prompt is free-form: type whatever b-roll idea you want. The UI scans the indexed library first, then shows a preview of the most relevant clips. Tick the clips you want and generate a selected pack to export those exact time ranges.
+
+### Portable index
+
+You can ship a prebuilt Chroma index separately from the raw videos when you intentionally want a portable demo. Do not commit private indexes to a public repo; indexes can contain source filenames, timestamps, and generated descriptions. For normal friend testing, use the UI Library section and let each tester index their own Drive folder locally.
+
+Set these optional environment variables before running the UI:
+
+```bash
+SENTRYSEARCH_DB_PATH=/path/to/shared/chroma-db
+SENTRYSEARCH_LIBRARY_ROOT=/path/to/video/library
+sentrysearch ui
+```
+
+`SENTRYSEARCH_DB_PATH` points at the shared Chroma DB folder. `SENTRYSEARCH_LIBRARY_ROOT` points at the local folder that contains the matching source videos. If the index was built on another machine, SentrySearch remaps missing indexed paths to files with the same names under that library root.
+
+### Friend testing setup
+
+For the cleanest friend test, have them clone the repo, add their own OpenRouter key, run the UI, paste their Google Drive for desktop folder into **Library**, and click **Index New Videos**. See [docs/FRIEND_SETUP.md](docs/FRIEND_SETUP.md) for the full setup guide and troubleshooting.
+
 ### Search by image
 
 Use a reference image as the query — useful for "find clips that look like this" when describing the scene in words is awkward (a screenshot of a specific car, a reference frame from another video, etc.).
@@ -150,9 +418,34 @@ Saved clip: ./match_2026-03-12_10-44-17-left_repeater_00m00s-00m30s.mp4
 
 The image is embedded into the same vector space as the indexed video chunks and ranked by cosine similarity. All `search` flags are supported (`--results`, `--threshold`, `--save-top`, `--overlay`, `--no-trim`, `--backend`, `--model`).
 
-Supported formats: JPG, PNG, WEBP, GIF, HEIC/HEIF on the Gemini backend; the local backend additionally accepts anything PIL can decode (BMP, TIFF, etc.).
+Supported formats: JPG, PNG, WEBP, GIF, HEIC/HEIF on the Gemini backend; OpenRouter supports common web image formats such as JPG, PNG, and WEBP; the local backend additionally accepts anything PIL can decode (BMP, TIFF, etc.).
 
 > **Note:** Image search returns *visually similar* matches, not necessarily the same object. A red sedan query may surface other red sedans of similar shape — calibrate expectations accordingly.
+
+### OpenRouter Backend
+
+Use this when you want Gemini through OpenRouter instead of a direct Gemini API key. SentrySearch samples frames from each video chunk, asks an OpenRouter Gemini vision model for short b-roll tags, and embeds those tags locally with Chroma's MiniLM text model.
+
+Add the key to your stable config file:
+
+```bash
+OPENROUTER_API_KEY=your-openrouter-key
+```
+
+Then index and search:
+
+```bash
+sentrysearch index /path/to/footage --backend openrouter
+sentrysearch broll "wide office exterior, people walking, daylight" --clips 5
+```
+
+The default OpenRouter model is `google/gemini-2.5-flash`. You can override it with a full OpenRouter model ID:
+
+```bash
+sentrysearch index /path/to/footage --backend openrouter --model google/gemini-2.5-flash
+```
+
+OpenRouter indexes are isolated from direct Gemini and local-model indexes, so vectors from different backends never mix.
 
 ### Local Backend (no API key needed)
 

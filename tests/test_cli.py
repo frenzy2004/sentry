@@ -1,5 +1,6 @@
 """Tests for sentrysearch.cli (Click CLI)."""
 
+import csv
 import os
 from unittest.mock import MagicMock, patch
 
@@ -76,6 +77,147 @@ class TestSearchCommand:
             assert "No indexed footage" in result.output
 
 
+class TestBrollCommand:
+    def test_broll_saves_multiple_clips_by_default(self, runner):
+        results = [
+            {"source_file": "/a.mp4", "start_time": i * 30.0,
+             "end_time": (i + 1) * 30.0, "similarity_score": 0.9 - i * 0.01}
+            for i in range(5)
+        ]
+        with patch("sentrysearch.store.SentryStore") as MockStore, \
+             patch("sentrysearch.embedder.get_embedder", return_value=MagicMock()), \
+             patch("sentrysearch.store.detect_index", return_value=("gemini", None)), \
+             patch("sentrysearch.search.search_footage", return_value=results) as mock_search, \
+             patch("sentrysearch.trimmer.trim_top_results",
+                   return_value=[f"/tmp/broll{i}.mp4" for i in range(5)]) as mock_trim, \
+             patch("sentrysearch.cli._cache_last_clip"), \
+             patch("sentrysearch.cli._open_file"):
+            inst = MagicMock()
+            inst.get_stats.return_value = {"total_chunks": 5}
+            MockStore.return_value = inst
+            result = runner.invoke(cli, ["broll", "city traffic"])
+
+        assert result.exit_code == 0, result.output
+        mock_search.assert_called_once()
+        assert mock_search.call_args.kwargs["n_results"] == 10
+        mock_trim.assert_called_once()
+        assert mock_trim.call_args.kwargs["count"] == 5
+        assert "Saved clip" in result.output
+
+    def test_broll_clips_rejects_zero(self, runner):
+        result = runner.invoke(cli, ["broll", "city traffic", "--clips", "0"])
+        assert result.exit_code != 0
+
+    def test_broll_pack_saves_prompt_folders_and_manifest(self, runner, tmp_path):
+        def fake_search(query, _store, n_results=5, verbose=False):
+            slug = query.replace(" ", "_")
+            return [
+                {
+                    "source_file": f"/source/{slug}_{i}.mp4",
+                    "start_time": i * 60.0,
+                    "end_time": i * 60.0 + 25.0,
+                    "similarity_score": 0.9 - i * 0.01,
+                    "description": f"{query} result {i}",
+                }
+                for i in range(3)
+            ]
+
+        def fake_trim(source_file, start_time, end_time, output_path):
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with open(output_path, "wb") as f:
+                f.write(b"clip")
+            return output_path
+
+        out_dir = tmp_path / "packs"
+        with patch("sentrysearch.store.SentryStore") as MockStore, \
+             patch("sentrysearch.embedder.get_embedder", return_value=MagicMock()), \
+             patch("sentrysearch.store.detect_index",
+                   return_value=("openrouter", "google/gemini-2.5-flash")), \
+             patch("sentrysearch.search.search_footage",
+                   side_effect=fake_search) as mock_search, \
+             patch("sentrysearch.trimmer.trim_clip",
+                   side_effect=fake_trim) as mock_trim, \
+             patch("sentrysearch.cli._cache_last_clip"):
+            inst = MagicMock()
+            inst.get_stats.return_value = {"total_chunks": 12}
+            MockStore.return_value = inst
+            result = runner.invoke(cli, [
+                "broll-pack",
+                "--prompt", "hands typing laptop",
+                "--prompt", "people laughing indoors",
+                "--clips", "2",
+                "--results", "5",
+                "--output-dir", str(out_dir),
+            ])
+
+        assert result.exit_code == 0, result.output
+        assert (out_dir / "hands_typing_laptop").is_dir()
+        assert (out_dir / "people_laughing_indoors").is_dir()
+        assert mock_search.call_count == 2
+        assert mock_trim.call_count == 4
+
+        with open(out_dir / "manifest.csv", newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) == 4
+        assert {r["category"] for r in rows} == {
+            "hands_typing_laptop", "people_laughing_indoors",
+        }
+        assert "Saved 4 clips" in result.output
+
+    def test_broll_pack_skips_near_duplicate_moments(self, runner, tmp_path):
+        results = [
+            {
+                "source_file": "/source/a.mp4",
+                "start_time": 0.0,
+                "end_time": 25.0,
+                "similarity_score": 0.9,
+            },
+            {
+                "source_file": "/source/a.mp4",
+                "start_time": 20.0,
+                "end_time": 45.0,
+                "similarity_score": 0.8,
+            },
+            {
+                "source_file": "/source/a.mp4",
+                "start_time": 80.0,
+                "end_time": 105.0,
+                "similarity_score": 0.7,
+            },
+        ]
+
+        def fake_trim(source_file, start_time, end_time, output_path):
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with open(output_path, "wb") as f:
+                f.write(b"clip")
+            return output_path
+
+        out_dir = tmp_path / "packs"
+        with patch("sentrysearch.store.SentryStore") as MockStore, \
+             patch("sentrysearch.embedder.get_embedder", return_value=MagicMock()), \
+             patch("sentrysearch.store.detect_index",
+                   return_value=("openrouter", "google/gemini-2.5-flash")), \
+             patch("sentrysearch.search.search_footage", return_value=results), \
+             patch("sentrysearch.trimmer.trim_clip",
+                   side_effect=fake_trim) as mock_trim, \
+             patch("sentrysearch.cli._cache_last_clip"):
+            inst = MagicMock()
+            inst.get_stats.return_value = {"total_chunks": 3}
+            MockStore.return_value = inst
+            result = runner.invoke(cli, [
+                "broll-pack",
+                "--prompt", "desk work",
+                "--clips", "2",
+                "--results", "3",
+                "--min-gap", "40",
+                "--output-dir", str(out_dir),
+            ])
+
+        assert result.exit_code == 0, result.output
+        selected_starts = [call.kwargs["start_time"] for call in mock_trim.call_args_list]
+        assert selected_starts == [0.0, 80.0]
+
+
 class TestIndexCommand:
     def test_index_no_supported_videos(self, runner, tmp_path):
         empty_dir = tmp_path / "empty"
@@ -95,6 +237,18 @@ class TestIndexCommand:
             MockStore.return_value = MagicMock()
             result = runner.invoke(cli, ["index", str(empty_dir), "--backend", "local"])
             assert result.exit_code == 0
+
+    def test_index_openrouter_uses_default_model(self, runner, tmp_path):
+        empty_dir = tmp_path / "empty"
+        empty_dir.mkdir()
+        with patch("sentrysearch.embedder.get_embedder", return_value=MagicMock()) as mock_get:
+            result = runner.invoke(cli, [
+                "index", str(empty_dir), "--backend", "openrouter",
+            ])
+        assert result.exit_code == 0
+        mock_get.assert_called_once_with(
+            "openrouter", model="google/gemini-2.5-flash", quantize=None,
+        )
 
     def test_index_scans_mov_files(self, runner, tmp_path):
         d = tmp_path / "vids"
@@ -483,6 +637,85 @@ class TestShellCommand:
         assert mock_search.call_count == 2  # REPL survived first failure
 
 
+class TestBrollShellCommand:
+    @pytest.fixture(autouse=True)
+    def _isolate_history(self, tmp_path):
+        with patch("sentrysearch.cli._HISTORY_PATH",
+                   str(tmp_path / "history")):
+            yield
+
+    def _setup_mocks(self, runner, input_lines, args=None,
+                     total_chunks=5, search_results=None):
+        mock_store = MagicMock()
+        mock_store.get_stats.return_value = {
+            "total_chunks": total_chunks, "unique_source_files": 1,
+        }
+        mock_embedder = MagicMock()
+        fake_results = search_results if search_results is not None else [[]]
+        cli_args = ["broll-shell"]
+        if args:
+            cli_args.extend(args)
+        with patch("sentrysearch.store.SentryStore", return_value=mock_store), \
+             patch("sentrysearch.store.detect_index", return_value=("openrouter", "google/gemini-2.5-flash")), \
+             patch("sentrysearch.embedder.get_embedder", return_value=mock_embedder) as mock_get, \
+             patch("sentrysearch.search.search_footage", side_effect=fake_results) as mock_search, \
+             patch("sentrysearch.trimmer.trim_top_results",
+                   return_value=["/tmp/clip1.mp4", "/tmp/clip2.mp4"]) as mock_trim, \
+             patch("sentrysearch.cli._cache_last_clip") as mock_cache, \
+             patch("sentrysearch.cli._open_file") as mock_open:
+            result = runner.invoke(cli, cli_args, input=input_lines)
+        return result, mock_get, mock_search, mock_trim, mock_cache, mock_open
+
+    def test_broll_shell_empty_index(self, runner):
+        mock_store = MagicMock()
+        mock_store.get_stats.return_value = {
+            "total_chunks": 0, "unique_source_files": 0,
+        }
+        with patch("sentrysearch.store.SentryStore", return_value=mock_store), \
+             patch("sentrysearch.store.detect_index", return_value=(None, None)), \
+             patch("sentrysearch.embedder.get_embedder", return_value=MagicMock()):
+            result = runner.invoke(cli, ["broll-shell"])
+        assert result.exit_code == 0
+        assert "No indexed footage" in result.output
+
+    def test_broll_shell_loads_once_and_saves_each_query(self, runner):
+        fake_results = [
+            {"source_file": "/v.mp4", "start_time": 0.0, "end_time": 30.0,
+             "similarity_score": 0.8},
+            {"source_file": "/v.mp4", "start_time": 30.0, "end_time": 60.0,
+             "similarity_score": 0.7},
+        ]
+        result, mock_get, mock_search, mock_trim, mock_cache, mock_open = self._setup_mocks(
+            runner,
+            input_lines="coffee shop\ncity night\n:quit\n",
+            args=["--clips", "2", "--no-open"],
+            search_results=[fake_results, fake_results],
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_get.call_count == 1
+        assert mock_search.call_count == 2
+        assert mock_trim.call_count == 2
+        assert mock_trim.call_args.kwargs["count"] == 2
+        assert mock_cache.call_count == 2
+        mock_open.assert_not_called()
+        assert "saved: /tmp/clip1.mp4" in result.output
+
+    def test_broll_shell_clips_command_updates_count(self, runner):
+        fake_results = [
+            {"source_file": "/v.mp4", "start_time": 0.0, "end_time": 30.0,
+             "similarity_score": 0.8},
+        ]
+        result, _, mock_search, mock_trim, _, _ = self._setup_mocks(
+            runner,
+            input_lines=":clips 3\nstreet detail\n:quit\n",
+            search_results=[fake_results],
+        )
+        assert result.exit_code == 0, result.output
+        assert "clips = 3" in result.output
+        assert mock_search.call_args.kwargs["n_results"] == 10
+        assert mock_trim.call_args.kwargs["count"] == 3
+
+
 class TestDlqCommand:
     def test_dlq_list_empty(self, runner, tmp_path):
         from sentrysearch.dlq import DeadLetterQueue
@@ -685,6 +918,26 @@ class TestSearchLocalFlags:
             assert result.exit_code == 0
             mock_get.assert_called_with("local", model="qwen2b", quantize=None)
             MockStore.assert_called_once_with(backend="local", model="qwen2b")
+
+    def test_search_auto_detects_openrouter_model(self, runner):
+        with patch("sentrysearch.store.SentryStore") as MockStore, \
+             patch("sentrysearch.embedder.get_embedder", return_value=MagicMock()) as mock_get, \
+             patch("sentrysearch.store.detect_index",
+                   return_value=("openrouter", "google/gemini-2.5-flash")), \
+             patch("sentrysearch.search.search_footage", return_value=[]):
+            inst = MagicMock()
+            inst.get_stats.return_value = {"total_chunks": 5}
+            MockStore.return_value = inst
+
+            result = runner.invoke(cli, ["search", "test query"])
+
+            assert result.exit_code == 0
+            mock_get.assert_called_with(
+                "openrouter", model="google/gemini-2.5-flash", quantize=None,
+            )
+            MockStore.assert_called_once_with(
+                backend="openrouter", model="google/gemini-2.5-flash",
+            )
 
     def test_search_wrong_model_shows_suggestion(self, runner):
         with patch("sentrysearch.store.SentryStore") as MockStore, \

@@ -10,15 +10,17 @@ def _search_with_embedding(
     n_results: int,
 ) -> list[dict]:
     hits = store.search(embedding, n_results=n_results)
-    results = [
-        {
+    results = []
+    for hit in hits:
+        result = {
             "source_file": hit["source_file"],
             "start_time": hit["start_time"],
             "end_time": hit["end_time"],
             "similarity_score": hit["score"],
         }
-        for hit in hits
-    ]
+        if "description" in hit:
+            result["description"] = hit["description"]
+        results.append(result)
     results.sort(key=lambda r: r["similarity_score"], reverse=True)
     return results
 

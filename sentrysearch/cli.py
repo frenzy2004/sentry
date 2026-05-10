@@ -1,7 +1,9 @@
 """Click-based CLI entry point."""
 
+import csv
 import os
 import platform
+import re
 import shutil
 import subprocess
 
@@ -9,6 +11,16 @@ import click
 from dotenv import load_dotenv
 
 _ENV_PATH = os.path.join(os.path.expanduser("~"), ".sentrysearch", ".env")
+BACKEND_CHOICES = ["gemini", "local", "openrouter"]
+BROLL_PACK_DEFAULT_PROMPTS = (
+    "hands typing laptop",
+    "people laughing indoors",
+    "outdoor night interview",
+    "office presentation screen",
+    "two people talking conference",
+    "establishing shot building",
+    "talking head",
+)
 
 # Load from stable config location first, then cwd as fallback
 load_dotenv(_ENV_PATH)
@@ -61,6 +73,12 @@ def _overlay_output_path(path: str) -> str:
     return f"{base}_overlay.mp4"
 
 
+def _default_openrouter_model() -> str:
+    from .openrouter_embedder import DEFAULT_OPENROUTER_MODEL
+
+    return DEFAULT_OPENROUTER_MODEL
+
+
 def _is_permanent_failure(exc: Exception) -> bool:
     """Return True for errors that won't resolve by retrying the same chunk."""
     msg = str(exc).lower()
@@ -91,13 +109,19 @@ def _embed_with_retry(
     """
     import time as _time
     from .gemini_embedder import GeminiAPIKeyError, GeminiQuotaError
+    from .openrouter_embedder import OpenRouterAPIKeyError, OpenRouterQuotaError
 
     chunk_id = chunk["chunk_id"]
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
             return embedder.embed_video_chunk(embed_path, verbose=verbose)
-        except (GeminiQuotaError, GeminiAPIKeyError):
+        except (
+            GeminiQuotaError,
+            GeminiAPIKeyError,
+            OpenRouterAPIKeyError,
+            OpenRouterQuotaError,
+        ):
             raise  # user-facing, stop the run
         except Exception as exc:
             last_exc = exc
@@ -134,13 +158,21 @@ def _handle_error(e: Exception) -> None:
     """Print a user-friendly error and exit."""
     from .gemini_embedder import GeminiAPIKeyError, GeminiQuotaError
     from .local_embedder import LocalModelError
+    from .openrouter_embedder import (
+        OpenRouterAPIKeyError,
+        OpenRouterError,
+        OpenRouterQuotaError,
+    )
     from .store import BackendMismatchError
 
-    if isinstance(e, GeminiAPIKeyError):
+    if isinstance(e, (GeminiAPIKeyError, OpenRouterAPIKeyError)):
         click.secho("Error: " + str(e), fg="red", err=True)
         raise SystemExit(1)
-    if isinstance(e, GeminiQuotaError):
+    if isinstance(e, (GeminiQuotaError, OpenRouterQuotaError)):
         click.secho("Error: " + str(e), fg="yellow", err=True)
+        raise SystemExit(1)
+    if isinstance(e, OpenRouterError):
+        click.secho("Error: " + str(e), fg="red", err=True)
         raise SystemExit(1)
     if isinstance(e, LocalModelError):
         click.secho("Error: " + str(e), fg="red", err=True)
@@ -321,11 +353,11 @@ def init():
               help="Target frames per second for preprocessing.")
 @click.option("--skip-still/--no-skip-still", default=True, show_default=True,
               help="Skip chunks with no meaningful visual change.")
-@click.option("--backend", type=click.Choice(["gemini", "local"]), default=None,
+@click.option("--backend", type=click.Choice(BACKEND_CHOICES), default=None,
               help="Embedding backend (default: gemini, or local when --model is set).")
 @click.option("--model", default=None, show_default=False,
-              help="Model for local backend: qwen8b, qwen2b, or HuggingFace ID "
-                   "(default: auto-detect from hardware). Implies --backend local.")
+              help="Model for local backend (qwen8b/qwen2b/HuggingFace ID) "
+                   "or OpenRouter model ID. Implies --backend local when --backend is omitted.")
 @click.option("--quantize/--no-quantize", default=None,
               help="Enable/disable 4-bit quantization for local backend (default: auto-detect).")
 @click.option("--retry-failed", is_flag=True,
@@ -365,6 +397,8 @@ def index(directory, chunk_duration, overlap, preprocess, target_resolution,
         if backend == "local" and model is None:
             model = detect_default_model()
             click.echo(f"Auto-detected model: {model}", err=True)
+        elif backend == "openrouter" and model is None:
+            model = _default_openrouter_model()
 
         # Normalize model key for consistent collection naming
         if backend == "local":
@@ -506,11 +540,15 @@ def index(directory, chunk_duration, overlap, preprocess, target_resolution,
                 if embedding is None:
                     dlq_chunks += 1
                     continue
-                store.add_chunk(chunk_id, embedding, {
+                chunk_metadata = {
                     "source_file": abs_path,
                     "start_time": chunk["start_time"],
                     "end_time": chunk["end_time"],
-                })
+                }
+                description = getattr(embedder, "last_description", None)
+                if description:
+                    chunk_metadata["description"] = description
+                store.add_chunk(chunk_id, embedding, chunk_metadata)
                 file_new_chunks += 1
 
             for f in files_to_cleanup:
@@ -556,30 +594,10 @@ def index(directory, chunk_duration, overlap, preprocess, target_resolution,
 # search
 # -----------------------------------------------------------------------
 
-@cli.command()
-@click.argument("query")
-@click.option("-n", "--results", "n_results", default=5, show_default=True,
-              help="Number of results to return.")
-@click.option("-o", "--output-dir", default="~/sentrysearch_clips", show_default=True,
-              help="Directory to save trimmed clips.")
-@click.option("--trim/--no-trim", default=True, show_default=True,
-              help="Auto-trim the top result.")
-@click.option("--save-top", default=None, type=click.IntRange(min=1),
-              help="Save the top N matching clips instead of just the #1 result (e.g. --save-top 3).")
-@click.option("--threshold", default=0.41, show_default=True, type=float,
-              help="Minimum similarity score to consider a confident match.")
-@click.option("--overlay/--no-overlay", default=False, show_default=True,
-              help="Burn Tesla telemetry overlay (speed, GPS, turn signals) onto trimmed clip.")
-@click.option("--backend", type=click.Choice(["gemini", "local"]), default=None,
-              help="Embedding backend (auto-detected from index if omitted).")
-@click.option("--model", default=None, show_default=False,
-              help="Model for local backend: qwen8b, qwen2b, or HuggingFace ID "
-                   "(default: auto-detect from index). Implies --backend local.")
-@click.option("--quantize/--no-quantize", default=None,
-              help="Enable/disable 4-bit quantization for local backend (default: auto-detect).")
-@click.option("--verbose", is_flag=True, help="Show debug info.")
-def search(query, n_results, output_dir, trim, save_top, threshold, overlay, backend, model, quantize, verbose):
-    """Search indexed footage with a natural language QUERY."""
+def _run_text_search(query, n_results, output_dir, trim, save_top, threshold,
+                     overlay, backend, model, quantize, verbose,
+                     command_name="search"):
+    """Run a natural-language search command and present/trim results."""
     from .embedder import get_embedder, reset_embedder
     from .local_embedder import normalize_model_key
     from .search import search_footage
@@ -592,8 +610,8 @@ def search(query, n_results, output_dir, trim, save_top, threshold, overlay, bac
         if model is not None and backend is None:
             backend = "local"
 
-        # Normalize model key for consistent collection naming
-        if model is not None:
+        # Normalize local model keys for consistent collection naming.
+        if backend == "local" and model is not None:
             model = normalize_model_key(model)
 
         # Auto-detect backend and model from whichever collection has data
@@ -603,8 +621,15 @@ def search(query, n_results, output_dir, trim, save_top, threshold, overlay, bac
             if model is None:
                 model = detected_model
         elif backend == "local" and model is None:
-            _, detected_model = detect_index()
-            model = detected_model
+            detected_backend, detected_model = detect_index()
+            if detected_backend == "local":
+                model = detected_model
+        elif backend == "openrouter" and model is None:
+            detected_backend, detected_model = detect_index()
+            if detected_backend == "openrouter":
+                model = detected_model
+            if model is None:
+                model = _default_openrouter_model()
 
         store = SentryStore(backend=backend, model=model)
 
@@ -615,7 +640,7 @@ def search(query, n_results, output_dir, trim, save_top, threshold, overlay, bac
                 click.echo(
                     f"No footage indexed with the {model} model. "
                     f"Your index uses {det_model}.\n\n"
-                    f"Try: sentrysearch search \"{query}\" --model {det_model}"
+                    f"Try: sentrysearch {command_name} \"{query}\" --model {det_model}"
                 )
             elif det_backend and det_backend != backend:
                 click.echo(
@@ -637,7 +662,7 @@ def search(query, n_results, output_dir, trim, save_top, threshold, overlay, bac
 
         get_embedder(backend, model=model, quantize=quantize)
 
-        # Ensure we fetch enough results for --save-top
+        # Ensure we fetch enough results for --save-top / --clips
         if save_top is not None and save_top > n_results:
             n_results = save_top
 
@@ -646,6 +671,336 @@ def search(query, n_results, output_dir, trim, save_top, threshold, overlay, bac
 
         results = search_footage(query, store, n_results=n_results, verbose=verbose)
         _present_results(results, threshold, trim, save_top, output_dir, overlay, verbose)
+
+    except Exception as e:
+        _handle_error(e)
+    finally:
+        reset_embedder()
+
+
+@cli.command()
+@click.argument("query")
+@click.option("-n", "--results", "n_results", default=5, show_default=True,
+              help="Number of results to return.")
+@click.option("-o", "--output-dir", default="~/sentrysearch_clips", show_default=True,
+              help="Directory to save trimmed clips.")
+@click.option("--trim/--no-trim", default=True, show_default=True,
+              help="Auto-trim the top result.")
+@click.option("--save-top", default=None, type=click.IntRange(min=1),
+              help="Save the top N matching clips instead of just the #1 result (e.g. --save-top 3).")
+@click.option("--threshold", default=0.41, show_default=True, type=float,
+              help="Minimum similarity score to consider a confident match.")
+@click.option("--overlay/--no-overlay", default=False, show_default=True,
+              help="Burn Tesla telemetry overlay (speed, GPS, turn signals) onto trimmed clip.")
+@click.option("--backend", type=click.Choice(BACKEND_CHOICES), default=None,
+              help="Embedding backend (auto-detected from index if omitted).")
+@click.option("--model", default=None, show_default=False,
+              help="Model for local backend: qwen8b, qwen2b, or HuggingFace ID "
+                   "(default: auto-detect from index). Implies --backend local.")
+@click.option("--quantize/--no-quantize", default=None,
+              help="Enable/disable 4-bit quantization for local backend (default: auto-detect).")
+@click.option("--verbose", is_flag=True, help="Show debug info.")
+def search(query, n_results, output_dir, trim, save_top, threshold, overlay, backend, model, quantize, verbose):
+    """Search indexed footage with a natural language QUERY."""
+    _run_text_search(
+        query, n_results, output_dir, trim, save_top, threshold, overlay,
+        backend, model, quantize, verbose,
+    )
+
+
+@cli.command()
+@click.argument("query")
+@click.option("-c", "--clips", default=5, show_default=True,
+              type=click.IntRange(min=1),
+              help="Number of matching b-roll clips to save.")
+@click.option("-n", "--results", "n_results", default=10, show_default=True,
+              help="Number of candidate results to rank before saving clips.")
+@click.option("-o", "--output-dir", default="~/sentrysearch_broll", show_default=True,
+              help="Directory to save b-roll clips.")
+@click.option("--threshold", default=0.41, show_default=True, type=float,
+              help="Minimum similarity score to consider a confident match.")
+@click.option("--overlay/--no-overlay", default=False, show_default=True,
+              help="Burn Tesla telemetry overlay (speed, GPS, turn signals) onto saved clips.")
+@click.option("--backend", type=click.Choice(BACKEND_CHOICES), default=None,
+              help="Embedding backend (auto-detected from index if omitted).")
+@click.option("--model", default=None, show_default=False,
+              help="Model for local backend: qwen8b, qwen2b, or HuggingFace ID "
+                   "(default: auto-detect from index). Implies --backend local.")
+@click.option("--quantize/--no-quantize", default=None,
+              help="Enable/disable 4-bit quantization for local backend (default: auto-detect).")
+@click.option("--verbose", is_flag=True, help="Show debug info.")
+def broll(query, clips, n_results, output_dir, threshold, overlay,
+          backend, model, quantize, verbose):
+    """Save multiple b-roll clips matching a natural language QUERY."""
+    _run_text_search(
+        query, n_results, output_dir, True, clips, threshold, overlay,
+        backend, model, quantize, verbose, command_name="broll",
+    )
+
+
+def _slugify_prompt(text: str) -> str:
+    """Return a short filesystem-safe slug for a prompt/category."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", text.strip().lower()).strip("_")
+    return slug or "broll"
+
+
+def _unique_slug(slug: str, used: set[str]) -> str:
+    """Return *slug* or a numbered variant not present in *used*."""
+    candidate = slug
+    n = 2
+    while candidate in used:
+        candidate = f"{slug}_{n}"
+        n += 1
+    used.add(candidate)
+    return candidate
+
+
+def _same_clip_moment(a: dict, b: dict, min_gap: float) -> bool:
+    """Return True when two hits are too close in the same source video."""
+    return (
+        a["source_file"] == b["source_file"]
+        and abs(float(a["start_time"]) - float(b["start_time"])) < min_gap
+    )
+
+
+def _select_broll_pack_results(
+    results: list[dict],
+    clips: int,
+    threshold: float,
+    min_gap: float,
+    taken: list[dict],
+) -> list[dict]:
+    """Pick non-near-duplicate results for a pack prompt."""
+    selected: list[dict] = []
+    for result in results:
+        if result["similarity_score"] < threshold:
+            continue
+        if any(_same_clip_moment(result, r, min_gap) for r in selected):
+            continue
+        if any(_same_clip_moment(result, r, min_gap) for r in taken):
+            continue
+        selected.append(result)
+        if len(selected) >= clips:
+            break
+    return selected
+
+
+def _pack_clip_filename(rank: int, result: dict) -> str:
+    """Build a stable filename for one pack clip."""
+    base = os.path.splitext(os.path.basename(result["source_file"]))[0]
+    base = re.sub(r"[^A-Za-z0-9_-]+", "_", base).strip("_")
+    start = _fmt_time(result["start_time"]).replace(":", "m") + "s"
+    end = _fmt_time(result["end_time"]).replace(":", "m") + "s"
+    return f"clip_{rank:02d}_{base}_{start}-{end}.mp4"
+
+
+def _read_pack_prompts(prompts: tuple[str, ...], prompts_file: str | None) -> list[str]:
+    """Collect pack prompts from repeated flags and/or a text file."""
+    collected = [p.strip() for p in prompts if p.strip()]
+    if prompts_file:
+        with open(os.path.expanduser(prompts_file), encoding="utf-8") as f:
+            for line in f:
+                prompt = line.strip()
+                if prompt and not prompt.startswith("#"):
+                    collected.append(prompt)
+    return collected or list(BROLL_PACK_DEFAULT_PROMPTS)
+
+
+def _write_broll_pack_manifest(output_dir: str, rows: list[dict]) -> str:
+    """Write the pack manifest CSV and return its path."""
+    manifest_path = os.path.join(output_dir, "manifest.csv")
+    fields = [
+        "prompt",
+        "category",
+        "rank",
+        "output_file",
+        "source_file",
+        "source_basename",
+        "start_time",
+        "end_time",
+        "similarity_score",
+        "description",
+    ]
+    with open(manifest_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    return manifest_path
+
+
+@cli.command("broll-pack")
+@click.option("--prompt", "prompts", multiple=True,
+              help="B-roll prompt/category to export. Repeat for multiple.")
+@click.option("--prompts-file", default=None, type=click.Path(dir_okay=False),
+              help="Text file with one prompt per line. # comments are ignored.")
+@click.option("-c", "--clips", default=5, show_default=True,
+              type=click.IntRange(min=1),
+              help="Number of clips to save per prompt/category.")
+@click.option("-n", "--results", "n_results", default=50, show_default=True,
+              type=click.IntRange(min=1),
+              help="Candidate results to scan per prompt before dedupe.")
+@click.option("-o", "--output-dir", default="~/sentrysearch_broll_packs",
+              show_default=True, help="Directory to create pack folders in.")
+@click.option("--threshold", default=0.0, show_default=True, type=float,
+              help="Minimum similarity score to save. 0 keeps best-effort batches.")
+@click.option("--min-gap", default=40.0, show_default=True, type=float,
+              help="Minimum seconds between clips from the same source video.")
+@click.option("--dedupe-across-pack/--allow-cross-prompt-duplicates",
+              default=True, show_default=True,
+              help="Avoid reusing the same source moment across categories.")
+@click.option("--overlay/--no-overlay", default=False, show_default=True,
+              help="Burn Tesla telemetry overlay onto saved clips.")
+@click.option("--backend", type=click.Choice(BACKEND_CHOICES), default=None,
+              help="Embedding backend (auto-detected from index if omitted).")
+@click.option("--model", default=None, show_default=False,
+              help="Model for local backend. Implies --backend local.")
+@click.option("--quantize/--no-quantize", default=None,
+              help="Enable/disable 4-bit quantization for local backend.")
+@click.option("--verbose", is_flag=True, help="Show debug info.")
+def broll_pack(prompts, prompts_file, clips, n_results, output_dir, threshold,
+               min_gap, dedupe_across_pack, overlay, backend, model,
+               quantize, verbose):
+    """Export folders of b-roll clips for several prompts at once."""
+    from .embedder import get_embedder, reset_embedder
+    from .local_embedder import normalize_model_key
+    from .search import search_footage
+    from .store import SentryStore, detect_index
+    from .trimmer import trim_clip
+
+    output_dir = os.path.expanduser(output_dir)
+    pack_prompts = _read_pack_prompts(prompts, prompts_file)
+    n_results = max(n_results, clips)
+
+    try:
+        if model is not None and backend is None:
+            backend = "local"
+        if backend == "local" and model is not None:
+            model = normalize_model_key(model)
+        if backend is None:
+            detected_backend, detected_model = detect_index()
+            backend = detected_backend or "gemini"
+            if model is None:
+                model = detected_model
+        elif backend == "local" and model is None:
+            detected_backend, detected_model = detect_index()
+            if detected_backend == "local":
+                model = detected_model
+        elif backend == "openrouter" and model is None:
+            detected_backend, detected_model = detect_index()
+            if detected_backend == "openrouter":
+                model = detected_model
+            if model is None:
+                model = _default_openrouter_model()
+
+        store = SentryStore(backend=backend, model=model)
+        if store.get_stats()["total_chunks"] == 0:
+            click.echo(
+                "No indexed footage found. "
+                "Run `sentrysearch index <directory>` first."
+            )
+            return
+
+        get_embedder(backend, model=model, quantize=quantize)
+        os.makedirs(output_dir, exist_ok=True)
+
+        if verbose:
+            click.echo(
+                f"  [verbose] backend={backend}, prompts={len(pack_prompts)}, "
+                f"clips={clips}, results={n_results}, min_gap={min_gap}",
+                err=True,
+            )
+
+        manifest_rows: list[dict] = []
+        used_slugs: set[str] = set()
+        taken: list[dict] = []
+        saved_paths: list[str] = []
+        failed = 0
+
+        for prompt in pack_prompts:
+            slug = _unique_slug(_slugify_prompt(prompt), used_slugs)
+            prompt_dir = os.path.join(output_dir, slug)
+            os.makedirs(prompt_dir, exist_ok=True)
+            click.echo(f"\n[{slug}] {prompt}")
+
+            results = search_footage(
+                prompt, store, n_results=n_results, verbose=verbose,
+            )
+            selected = _select_broll_pack_results(
+                results,
+                clips=clips,
+                threshold=threshold,
+                min_gap=min_gap,
+                taken=taken if dedupe_across_pack else [],
+            )
+
+            if not selected:
+                click.echo("  no clips matched this category")
+                continue
+
+            if len(selected) < clips:
+                click.secho(
+                    f"  only {len(selected)}/{clips} clips after dedupe/filtering",
+                    fg="yellow",
+                )
+
+            for rank, result in enumerate(selected, 1):
+                output_path = os.path.join(
+                    prompt_dir, _pack_clip_filename(rank, result),
+                )
+                try:
+                    clip_path = trim_clip(
+                        source_file=result["source_file"],
+                        start_time=result["start_time"],
+                        end_time=result["end_time"],
+                        output_path=output_path,
+                    )
+                    if overlay:
+                        _apply_overlay_to_clip(
+                            clip_path,
+                            result["source_file"],
+                            result["start_time"],
+                            result["end_time"],
+                        )
+                except Exception as exc:
+                    failed += 1
+                    click.secho(
+                        f"  failed clip {rank}: {exc}",
+                        fg="yellow",
+                        err=True,
+                    )
+                    continue
+
+                saved_paths.append(clip_path)
+                if dedupe_across_pack:
+                    taken.append(result)
+                manifest_rows.append({
+                    "prompt": prompt,
+                    "category": slug,
+                    "rank": rank,
+                    "output_file": clip_path,
+                    "source_file": result["source_file"],
+                    "source_basename": os.path.basename(result["source_file"]),
+                    "start_time": float(result["start_time"]),
+                    "end_time": float(result["end_time"]),
+                    "similarity_score": float(result["similarity_score"]),
+                    "description": result.get("description", ""),
+                })
+                click.echo(
+                    f"  saved {rank}: {clip_path} "
+                    f"[{result['similarity_score']:.2f}]"
+                )
+
+        manifest_path = _write_broll_pack_manifest(output_dir, manifest_rows)
+        if saved_paths:
+            _cache_last_clip(saved_paths[0])
+
+        summary = (
+            f"\nSaved {len(saved_paths)} clips across {len(pack_prompts)} "
+            f"categories.\nManifest: {manifest_path}"
+        )
+        if failed:
+            summary += f"\nFailed clips: {failed}"
+        click.echo(summary)
 
     except Exception as e:
         _handle_error(e)
@@ -681,6 +1036,8 @@ def _present_results(results, threshold, trim, save_top, output_dir, overlay, ve
         score = r["similarity_score"]
         if verbose:
             click.echo(f"  #{i} [{score:.6f}] {basename} @ {start_str}-{end_str}")
+            if r.get("description"):
+                click.echo(f"      {r['description']}")
         else:
             click.echo(f"  #{i} [{score:.2f}] {basename} @ {start_str}-{end_str}")
 
@@ -726,7 +1083,7 @@ def _present_results(results, threshold, trim, save_top, output_dir, overlay, ve
               help="Minimum similarity score to consider a confident match.")
 @click.option("--overlay/--no-overlay", default=False, show_default=True,
               help="Apply Tesla telemetry overlay to saved clips.")
-@click.option("--backend", type=click.Choice(["gemini", "local"]), default=None,
+@click.option("--backend", type=click.Choice(BACKEND_CHOICES), default=None,
               help="Embedding backend (auto-detected from index if omitted).")
 @click.option("--model", default=None,
               help="Model for local backend (default: auto-detect from index).")
@@ -746,7 +1103,7 @@ def img(image, n_results, output_dir, trim, save_top, threshold, overlay,
     try:
         if model is not None and backend is None:
             backend = "local"
-        if model is not None:
+        if backend == "local" and model is not None:
             model = normalize_model_key(model)
         if backend is None:
             detected_backend, detected_model = detect_index()
@@ -754,7 +1111,15 @@ def img(image, n_results, output_dir, trim, save_top, threshold, overlay,
             if model is None:
                 model = detected_model
         elif backend == "local" and model is None:
-            _, model = detect_index()
+            detected_backend, detected_model = detect_index()
+            if detected_backend == "local":
+                model = detected_model
+        elif backend == "openrouter" and model is None:
+            detected_backend, detected_model = detect_index()
+            if detected_backend == "openrouter":
+                model = detected_model
+            if model is None:
+                model = _default_openrouter_model()
 
         store = SentryStore(backend=backend, model=model)
 
@@ -809,8 +1174,33 @@ def _print_shell_results(results, threshold):
         )
 
 
+def _save_shell_broll(results, threshold, output_dir, clips, overlay, open_first):
+    """Print ranked matches, save the top clips, and optionally open rank one."""
+    if not results:
+        click.echo("  (no results)")
+        return
+
+    _print_shell_results(results, threshold)
+
+    from .trimmer import trim_top_results
+
+    clip_paths = trim_top_results(results, output_dir, count=clips)
+    for i, clip_path in enumerate(clip_paths):
+        if overlay:
+            r = results[i]
+            _apply_overlay_to_clip(
+                clip_path, r["source_file"], r["start_time"], r["end_time"],
+            )
+        click.echo(f"  saved: {clip_path}")
+
+    if clip_paths:
+        _cache_last_clip(clip_paths[0])
+        if open_first:
+            _open_file(clip_paths[0])
+
+
 @cli.command()
-@click.option("--backend", type=click.Choice(["gemini", "local"]), default=None,
+@click.option("--backend", type=click.Choice(BACKEND_CHOICES), default=None,
               help="Embedding backend (auto-detected from index if omitted).")
 @click.option("--model", default=None,
               help="Model for local backend (default: auto-detect from index).")
@@ -842,7 +1232,7 @@ def shell(backend, model, quantize, n_results, threshold, verbose):
         # Resolve backend/model (mirrors `search`)
         if model is not None and backend is None:
             backend = "local"
-        if model is not None:
+        if backend == "local" and model is not None:
             model = normalize_model_key(model)
         if backend is None:
             detected_backend, detected_model = detect_index()
@@ -850,7 +1240,15 @@ def shell(backend, model, quantize, n_results, threshold, verbose):
             if model is None:
                 model = detected_model
         elif backend == "local" and model is None:
-            _, model = detect_index()
+            detected_backend, detected_model = detect_index()
+            if detected_backend == "local":
+                model = detected_model
+        elif backend == "openrouter" and model is None:
+            detected_backend, detected_model = detect_index()
+            if detected_backend == "openrouter":
+                model = detected_model
+            if model is None:
+                model = _default_openrouter_model()
 
         store = SentryStore(backend=backend, model=model)
         stats = store.get_stats()
@@ -942,6 +1340,204 @@ def shell(backend, model, quantize, n_results, threshold, verbose):
         reset_embedder()
 
 
+@cli.command("broll-shell")
+@click.option("--backend", type=click.Choice(BACKEND_CHOICES), default=None,
+              help="Embedding backend (auto-detected from index if omitted).")
+@click.option("--model", default=None,
+              help="Model for local backend (default: auto-detect from index).")
+@click.option("--quantize/--no-quantize", default=None,
+              help="Enable/disable 4-bit quantization for local backend.")
+@click.option("-c", "--clips", default=5, show_default=True,
+              type=click.IntRange(min=1),
+              help="Number of b-roll clips to save per query.")
+@click.option("-n", "--results", "n_results", default=10, show_default=True,
+              help="Number of candidates to rank before saving clips.")
+@click.option("-o", "--output-dir", default="~/sentrysearch_broll", show_default=True,
+              help="Directory to save b-roll clips.")
+@click.option("--threshold", default=0.41, show_default=True, type=float,
+              help="Minimum similarity score to consider a confident match.")
+@click.option("--overlay/--no-overlay", default=False, show_default=True,
+              help="Burn Tesla telemetry overlay onto saved clips.")
+@click.option("--open/--no-open", "open_first", default=True, show_default=True,
+              help="Open the first saved clip after each query.")
+@click.option("--verbose", is_flag=True, help="Show debug info.")
+def broll_shell(backend, model, quantize, clips, n_results, output_dir,
+                threshold, overlay, open_first, verbose):
+    """Start a fast b-roll session that saves clips from plain prompts.
+
+    This is the SentrySearch demo flow adapted for b-roll: load the index once,
+    then type short prompts and get saved clips without restarting Python,
+    Chroma, or the local text embedder each time.
+
+    Meta-commands:
+      :clips <int>   change clips saved per query
+      :n <int>       change candidates ranked per query
+      :open on|off   toggle opening rank one
+      :help          show help
+      :quit          exit (Ctrl-D also works)
+    """
+    from .embedder import get_embedder, reset_embedder
+    from .local_embedder import normalize_model_key
+    from .search import search_footage
+    from .store import SentryStore, detect_index
+
+    output_dir = os.path.expanduser(output_dir)
+
+    try:
+        if model is not None and backend is None:
+            backend = "local"
+        if backend == "local" and model is not None:
+            model = normalize_model_key(model)
+        if backend is None:
+            detected_backend, detected_model = detect_index()
+            backend = detected_backend or "gemini"
+            if model is None:
+                model = detected_model
+        elif backend == "local" and model is None:
+            detected_backend, detected_model = detect_index()
+            if detected_backend == "local":
+                model = detected_model
+        elif backend == "openrouter" and model is None:
+            detected_backend, detected_model = detect_index()
+            if detected_backend == "openrouter":
+                model = detected_model
+            if model is None:
+                model = _default_openrouter_model()
+
+        store = SentryStore(backend=backend, model=model)
+        stats = store.get_stats()
+        if stats["total_chunks"] == 0:
+            click.echo("No indexed footage. Run `sentrysearch index <dir>` first.")
+            return
+
+        label = backend + (f" ({model})" if model else "")
+        click.echo(f"Loading {label}...")
+        get_embedder(backend, model=model, quantize=quantize)
+
+        try:
+            import readline
+            os.makedirs(os.path.dirname(_HISTORY_PATH), exist_ok=True)
+            if os.path.exists(_HISTORY_PATH):
+                try:
+                    readline.read_history_file(_HISTORY_PATH)
+                except OSError:
+                    pass
+            readline.set_history_length(1000)
+        except ImportError:
+            readline = None
+
+        click.secho(
+            f"Ready. {stats['total_chunks']} chunks indexed. "
+            f"{clips} clips/query. Type a b-roll prompt, :help for commands.",
+            fg="green",
+        )
+
+        while True:
+            try:
+                query = input("broll> ").strip()
+            except EOFError:
+                click.echo()
+                break
+            except KeyboardInterrupt:
+                click.echo()
+                continue
+            if not query:
+                continue
+
+            if query.startswith(":"):
+                cmd, _, arg = query[1:].partition(" ")
+                cmd = cmd.strip().lower()
+                arg = arg.strip()
+                if cmd in ("q", "quit", "exit"):
+                    break
+                if cmd == "help":
+                    click.echo(
+                        ":clips <int>   set clips saved per query "
+                        f"(current: {clips})\n"
+                        ":n <int>       set candidate count "
+                        f"(current: {n_results})\n"
+                        ":open on|off   toggle opening rank one "
+                        f"(current: {'on' if open_first else 'off'})\n"
+                        ":help          show this help\n"
+                        ":quit          exit"
+                    )
+                    continue
+                if cmd in ("c", "clips"):
+                    try:
+                        new_clips = int(arg)
+                        if new_clips < 1:
+                            raise ValueError
+                        clips = new_clips
+                        click.echo(f"clips = {clips}")
+                    except ValueError:
+                        click.secho("usage: :clips <positive int>", fg="yellow")
+                    continue
+                if cmd == "n":
+                    try:
+                        new_n = int(arg)
+                        if new_n < 1:
+                            raise ValueError
+                        n_results = new_n
+                        click.echo(f"n_results = {n_results}")
+                    except ValueError:
+                        click.secho("usage: :n <positive int>", fg="yellow")
+                    continue
+                if cmd == "open":
+                    value = arg.lower()
+                    if value in ("on", "yes", "true", "1"):
+                        open_first = True
+                    elif value in ("off", "no", "false", "0"):
+                        open_first = False
+                    else:
+                        click.secho("usage: :open on|off", fg="yellow")
+                        continue
+                    click.echo(f"open = {'on' if open_first else 'off'}")
+                    continue
+                click.secho(f"unknown command: :{cmd}", fg="yellow")
+                continue
+
+            try:
+                results = search_footage(
+                    query, store, n_results=max(n_results, clips),
+                    verbose=verbose,
+                )
+                _save_shell_broll(
+                    results, threshold, output_dir, clips, overlay, open_first,
+                )
+            except Exception as e:
+                click.secho(f"Error: {e}", fg="red")
+                continue
+
+        if readline is not None:
+            try:
+                readline.write_history_file(_HISTORY_PATH)
+            except OSError:
+                pass
+
+    except Exception as e:
+        _handle_error(e)
+    finally:
+        reset_embedder()
+
+
+# -----------------------------------------------------------------------
+# ui
+# -----------------------------------------------------------------------
+
+@cli.command()
+@click.option("--host", default="127.0.0.1", show_default=True,
+              help="Host interface for the local UI server.")
+@click.option("--port", default=8765, show_default=True, type=int,
+              help="Port for the local UI server.")
+@click.option("--open/--no-open", "open_browser", default=False,
+              show_default=True, help="Open the UI in your default browser.")
+def ui(host, port, open_browser):
+    """Start a local web UI for b-roll search and pack generation."""
+    from .ui import serve
+
+    serve(host=host, port=port, open_browser=open_browser)
+
+
 # -----------------------------------------------------------------------
 # overlay
 # -----------------------------------------------------------------------
@@ -1014,22 +1610,31 @@ def stats():
 # -----------------------------------------------------------------------
 
 @cli.command()
-@click.option("--backend", type=click.Choice(["gemini", "local"]), default=None,
+@click.option("--backend", type=click.Choice(BACKEND_CHOICES), default=None,
               help="Backend to reset (auto-detected if omitted).")
 @click.option("--model", default=None,
               help="Model to reset (auto-detected if omitted). Implies --backend local.")
 @click.confirmation_option(prompt="This will delete all indexed data. Continue?")
 def reset(backend, model):
     """Delete all indexed data."""
+    from .local_embedder import normalize_model_key
     from .store import SentryStore, detect_index
 
     if model is not None and backend is None:
         backend = "local"
+    if backend == "local" and model is not None:
+        model = normalize_model_key(model)
     if backend is None:
         backend, detected_model = detect_index()
         backend = backend or "gemini"
         if model is None:
             model = detected_model
+    elif backend == "openrouter" and model is None:
+        detected_backend, detected_model = detect_index()
+        if detected_backend == "openrouter":
+            model = detected_model
+        if model is None:
+            model = _default_openrouter_model()
 
     store = SentryStore(backend=backend, model=model)
     s = store.get_stats()
@@ -1050,7 +1655,7 @@ def reset(backend, model):
 
 @cli.command()
 @click.argument("files", nargs=-1, required=True)
-@click.option("--backend", type=click.Choice(["gemini", "local"]), default=None,
+@click.option("--backend", type=click.Choice(BACKEND_CHOICES), default=None,
               help="Backend to remove from (auto-detected if omitted).")
 @click.option("--model", default=None,
               help="Model to remove from (auto-detected if omitted). Implies --backend local.")
@@ -1059,15 +1664,24 @@ def remove(files, backend, model):
 
     Accepts full paths or substrings that match indexed file paths.
     """
+    from .local_embedder import normalize_model_key
     from .store import SentryStore, detect_index
 
     if model is not None and backend is None:
         backend = "local"
+    if backend == "local" and model is not None:
+        model = normalize_model_key(model)
     if backend is None:
         backend, detected_model = detect_index()
         backend = backend or "gemini"
         if model is None:
             model = detected_model
+    elif backend == "openrouter" and model is None:
+        detected_backend, detected_model = detect_index()
+        if detected_backend == "openrouter":
+            model = detected_model
+        if model is None:
+            model = _default_openrouter_model()
 
     store = SentryStore(backend=backend, model=model)
     s = store.get_stats()
