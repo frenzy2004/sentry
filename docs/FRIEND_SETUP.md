@@ -39,12 +39,18 @@ If `uv` is not found after installing, close and reopen PowerShell.
 
 ## Step 1: Clone and install
 
-Use the final repo URL:
+Use this repo:
 
 ```powershell
 git clone https://github.com/frenzy2004/sentry.git sentrysearch-broll
 cd sentrysearch-broll
 uv sync
+```
+
+If `uv sync` fails on Windows with `invalid peer certificate: UnknownIssuer`, rerun it with system certificates:
+
+```powershell
+uv sync --system-certs
 ```
 
 ## Step 2: Add the OpenRouter key
@@ -93,6 +99,12 @@ From the repo folder:
 uv run sentrysearch ui
 ```
 
+If the same certificate issue appears while running commands, use:
+
+```powershell
+uv run --system-certs sentrysearch ui
+```
+
 Open:
 
 ```text
@@ -136,6 +148,30 @@ Single saved clips are saved under:
 
 ```text
 drive_videos\ui_saved
+```
+
+## If using Claude Code
+
+Open Claude Code in the cloned repo folder and send this:
+
+```text
+I cloned https://github.com/frenzy2004/sentry.git. Please help me run the local SentrySearch b-roll UI.
+
+Use this flow:
+1. Check that Git, Python 3.11+, and uv are installed.
+2. Run uv sync from the repo folder. If Windows shows `invalid peer certificate: UnknownIssuer`, run uv sync --system-certs.
+3. Make sure C:\Users\<my-windows-name>\.sentrysearch\.env exists with OPENROUTER_API_KEY.
+4. Run uv run sentrysearch ui. If the same certificate issue appears, run uv run --system-certs sentrysearch ui.
+5. Open http://127.0.0.1:8765.
+6. In the UI Library section, I will paste my Google Drive/local video folder, scan it, and index new videos.
+
+Do not commit or print my API key. Do not upload my videos. Everything should stay local except OpenRouter calls during indexing.
+```
+
+If something fails, ask Claude Code to inspect:
+
+```text
+drive_videos\index_logs
 ```
 
 ## What calls the API

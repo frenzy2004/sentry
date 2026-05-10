@@ -11,6 +11,7 @@ Semantic search over video footage. Type what you're looking for, get a trimmed 
 - [How it works](#how-it-works)
 - [Getting Started](#getting-started)
 - [B-roll App Quick Start for Testers](#b-roll-app-quick-start-for-testers)
+  - [Using Claude Code](#using-claude-code)
 - [Usage](#usage)
   - [Init](#init)
   - [Index footage](#index-footage)
@@ -123,15 +124,21 @@ Close and reopen PowerShell after installing `uv`.
 
 ### Clone and install
 
-Use the repo or branch that contains this b-roll UI work:
+Use this repo:
 
 ```powershell
-git clone <YOUR_REPO_URL> sentrysearch-broll
+git clone https://github.com/frenzy2004/sentry.git sentrysearch-broll
 cd sentrysearch-broll
 uv sync
 ```
 
-If you are giving this to a friend, push this project to your own repo first and send them that repo URL. The original upstream repo may not contain the b-roll UI additions yet.
+The original upstream repo may not contain the b-roll UI additions yet, so use the `frenzy2004/sentry` repo above for this version.
+
+If `uv sync` fails on Windows with `invalid peer certificate: UnknownIssuer`, rerun it with system certificates:
+
+```powershell
+uv sync --system-certs
+```
 
 ### Add the OpenRouter key
 
@@ -208,6 +215,12 @@ cd sentrysearch-broll
 uv run sentrysearch ui
 ```
 
+If the same certificate issue appears while running commands, use:
+
+```powershell
+uv run --system-certs sentrysearch ui
+```
+
 Then in the browser:
 
 1. Search normally.
@@ -263,6 +276,26 @@ If indexing asks for `OPENROUTER_API_KEY`, add it to `C:\Users\<name>\.sentrysea
 If indexing is slow, that is normal for large videos. Google Drive may also stream the source file the first time it is read.
 
 If disk space gets low, delete old generated clips from `drive_videos\broll_packs_ui` and `drive_videos\ui_saved`.
+
+### Using Claude Code
+
+If your friend uses Claude Code, they can clone the repo normally and ask Claude Code to help run it. Send them this prompt:
+
+```text
+I cloned https://github.com/frenzy2004/sentry.git. Please help me run the local SentrySearch b-roll UI.
+
+Use this flow:
+1. Check that Git, Python 3.11+, and uv are installed.
+2. Run uv sync from the repo folder. If Windows shows `invalid peer certificate: UnknownIssuer`, run uv sync --system-certs.
+3. Make sure C:\Users\<my-windows-name>\.sentrysearch\.env exists with OPENROUTER_API_KEY.
+4. Run uv run sentrysearch ui. If the same certificate issue appears, run uv run --system-certs sentrysearch ui.
+5. Open http://127.0.0.1:8765.
+6. In the UI Library section, I will paste my Google Drive/local video folder, scan it, and index new videos.
+
+Do not commit or print my API key. Do not upload my videos. Everything should stay local except OpenRouter calls during indexing.
+```
+
+Claude Code can help with setup errors, but the app itself is still local. If indexing new videos fails, ask it to inspect `drive_videos\index_logs`.
 
 ## Usage
 
